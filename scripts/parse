@@ -1,0 +1,246 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["pdfplumber"]
+# ///
+"""Parse the archived RA-APPS imobile PDFs into CSVs (derived layer).
+
+Reads the three PDFs in data/ and regenerates the three CSVs next to them. The PDFs
+are the canonical ground truth (see docs/adr/0001); the CSVs are a derived, regenerable
+view (see docs/adr/0002). This script never touches the PDFs and must run *after* the
+archive step — a parse failure must not gate the archive.
+
+Fidelity: near-verbatim. Cell values are copied as printed; only intra-cell whitespace
+and newlines are collapsed to single spaces. No date/number normalization.
+
+Fail loud: each list has a pinned header signature and sanity checks. On any mismatch
+(missing list, header drift, wrong column count, a data row with no sucursala, zero rows,
+or an unclassifiable row) the script exits non-zero and writes nothing for that list.
+
+Output contract (for the GitHub Action):
+  - stdout: the commit-message body (rows written per CSV)
+  - stderr: human-readable progress logs
+  - exit 0: all three lists parsed and written
+  - exit 1: fail loud
+"""
+
+import csv
+import re
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import pdfplumber
+
+DATA = Path(__file__).resolve().parent.parent / "data"
+
+
+@dataclass(frozen=True)
+class ListSpec:
+    pdf: str  # source PDF filename in data/
+    csv: str  # output CSV filename in data/
+    # output column slug -> source column index in the extracted table grid
+    columns: dict[str, int]
+    # substrings that must all appear in the (concatenated) header rows
+    header_signature: list[str] = field(default_factory=list)
+
+    @property
+    def ncols(self) -> int:
+        # The table grid has at least this many columns (mapping is positional).
+        return max(self.columns.values()) + 1
+
+
+SPECS = [
+    ListSpec(
+        pdf="persoane-juridice.pdf",
+        csv="persoane-juridice.csv",
+        columns={
+            "nr_crt": 0,
+            "denumire_persoana_juridica": 1,
+            "adresa_imobil": 2,
+            "constructie_mp": 3,
+            "teren_mp": 4,
+            "tip_contract": 5,
+            "modalitate_atribuire": 6,
+            "data_inceput": 7,
+            "data_incetare": 8,
+            "pret_ron": 9,
+            "pret_eur": 10,
+        },
+        header_signature=[
+            "Denumirea persoanei juridice",
+            "Adresa",
+            "Construcție mp",
+            "Teren mp",
+            "Modalitatea de atribuire",
+            "RON",
+            "EURO",
+        ],
+    ),
+    ListSpec(
+        pdf="persoane-fizice.pdf",
+        csv="persoane-fizice.csv",
+        columns={
+            "nr_crt": 0,
+            "adresa_imobil": 1,
+            "constructie_mp": 2,
+            "teren_mp": 3,
+            "modalitate_atribuire": 4,
+            "data_inceput": 5,
+            "data_incetare": 6,
+            "pret_ron": 7,
+            "pret_eur": 8,
+        },
+        header_signature=[
+            "Adresa",
+            "Construcție mp",
+            "Teren mp",
+            "Modalitatea de atribuire",
+            "RON",
+            "EURO",
+        ],
+    ),
+    ListSpec(
+        pdf="neocupate.pdf",
+        csv="neocupate.csv",
+        columns={
+            "nr_crt": 0,
+            "adresa_imobil": 1,
+            "constructie_mp": 2,
+            "teren_mp": 3,
+            "observatii": 4,
+        },
+        header_signature=["Adresa", "Construcție mp", "Teren mp", "Observații"],
+    ),
+]
+
+
+def log(msg: str) -> None:
+    print(msg, file=sys.stderr)
+
+
+def clean(cell: str | None) -> str:
+    """Collapse intra-cell whitespace/newlines; otherwise verbatim."""
+    if cell is None:
+        return ""
+    return re.sub(r"\s+", " ", cell).strip()
+
+
+def is_header_row(cells: list[str]) -> bool:
+    first = cells[0]
+    if first.startswith("Nr crt"):
+        return True
+    # The sub-header continuation row: no number, but carries the unit labels.
+    joined = " ".join(cells)
+    return not first and ("Construcție mp" in joined or "Teren mp" in joined)
+
+
+def grouping_label(cells: list[str]) -> str | None:
+    """A section-header row has exactly one filled cell holding a unit name (not a number).
+
+    The label's column position is inconsistent across the lists (a 'Departamentul …'
+    sits in col 1 in some PDFs, col 0 in others), so detection is by content, not position.
+    """
+    nonempty = [c for c in cells if c]
+    if len(nonempty) != 1:
+        return None
+    val = nonempty[0]
+    if val.isdigit() or len(val) <= 3:
+        return None
+    return val
+
+
+def parse_list(spec: ListSpec) -> list[dict[str, str]]:
+    pdf_path = DATA / spec.pdf
+    if not pdf_path.exists():
+        raise SystemExit(f"FAIL: missing source PDF {pdf_path}")
+
+    rows: list[dict[str, str]] = []
+    sucursala = ""
+    departament = ""
+    header_text_parts: list[str] = []  # the signature spans 2 physical header rows
+
+    with pdfplumber.open(pdf_path) as pdf:
+        for pageno, page in enumerate(pdf.pages, start=1):
+            for table in page.extract_tables():
+                for raw in table:
+                    cells = [clean(c) for c in raw]
+                    if not any(cells):
+                        continue
+                    if is_header_row(cells):
+                        header_text_parts.append(" ".join(c for c in raw if c))
+                        continue
+                    label = grouping_label(cells)
+                    if label is not None:
+                        # Level 2 (department) nests under the current level-1 unit;
+                        # a new level-1 unit (SUCURSALA / REGIE) resets the department.
+                        if label.lower().startswith("departament"):
+                            departament = label
+                        else:
+                            sucursala, departament = label, ""
+                        continue
+                    # Candidate data row.
+                    if len(cells) < spec.ncols:
+                        raise SystemExit(
+                            f"FAIL [{spec.pdf} p{pageno}]: row has {len(cells)} cells, "
+                            f"expected >= {spec.ncols}: {cells}"
+                        )
+                    # A real imobil always has an address — use that as the discriminator.
+                    # nr_crt is positional and is occasionally dropped in extraction; an
+                    # empty address is the true "this isn't a data row" signal.
+                    addr = cells[spec.columns["adresa_imobil"]]
+                    if not addr:
+                        raise SystemExit(
+                            f"FAIL [{spec.pdf} p{pageno}]: unclassifiable row "
+                            f"(no address, first cell {cells[0]!r}): {cells}"
+                        )
+                    if not sucursala:
+                        raise SystemExit(
+                            f"FAIL [{spec.pdf} p{pageno}]: data row before any sucursala: {cells}"
+                        )
+                    if not cells[0].isdigit():
+                        log(f"  note [{spec.pdf} p{pageno}]: data row with empty nr_crt: {addr!r}")
+                    row = {"sucursala": sucursala, "departament": departament}
+                    row.update({name: cells[i] for name, i in spec.columns.items()})
+                    rows.append(row)
+
+    header_text = " ".join(header_text_parts)
+    missing = [sig for sig in spec.header_signature if sig not in header_text]
+    if missing:
+        raise SystemExit(
+            f"FAIL [{spec.pdf}]: header signature not found (missing {missing}) "
+            f"— layout may have changed"
+        )
+    if not rows:
+        raise SystemExit(f"FAIL [{spec.pdf}]: zero data rows parsed")
+    return rows
+
+
+def write_csv(spec: ListSpec, rows: list[dict[str, str]]) -> None:
+    # Column order: nr_crt, sucursala, departament, then the rest in spec order.
+    fieldnames = ["nr_crt", "sucursala", "departament"] + [
+        c for c in spec.columns if c != "nr_crt"
+    ]
+    out = DATA / spec.csv
+    with out.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def main() -> int:
+    summary: list[str] = []
+    for spec in SPECS:
+        log(f"Parsing {spec.pdf} -> {spec.csv}")
+        rows = parse_list(spec)
+        write_csv(spec, rows)
+        log(f"  wrote {len(rows)} rows")
+        summary.append(f"- {spec.csv}: {len(rows)} rows")
+
+    print("Update RA-APPS imobile CSVs (derived from PDFs)\n")
+    print("\n".join(summary))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

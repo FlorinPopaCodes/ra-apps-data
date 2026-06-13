@@ -31,6 +31,17 @@ Whether an imobil is in use by a third party (ocupat) or vacant — free, in
 litigation, in renovation, or proposed for sale/lease (neocupat).
 _Avoid_: Occupied/vacant in mixed-language field values; rented (rent is one of several occupation types)
 
+**Sucursală**:
+A regional unit of RA-APPS under which imobile are grouped in the lists (e.g.
+„Sucursala de Reprezentare și Protocol Victoria Cluj-Napoca"). The central
+administration appears as its own top-level unit labelled „REGIE".
+_Avoid_: Branch (use only as a gloss); region (a sucursală is an org unit, not a place)
+
+**Departament**:
+A sub-unit nested under a sucursală/REGIE (e.g. „Departamentul Scrovistea"). Imobile
+under a departament restart their `nr_crt` numbering. Not every imobil has one.
+_Avoid_: Treating it as a sucursală — it is one level finer
+
 **Beneficiar**:
 The third party using an ocupat imobil. Either a persoană juridică (legal entity)
 or a persoană fizică (natural person, name redacted under GDPR).

@@ -28,14 +28,30 @@ jobs:
           # Fails loud (non-zero) if the three expected lists aren't found.
           uv run scripts/scrape > "$RUNNER_TEMP/commit-msg.txt"
 
-      - name: Commit changes
+      - name: Commit PDFs
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A data/
+          git add -A data/*.pdf
           if git diff --staged --quiet; then
-            echo "No changes — nothing to commit."
+            echo "No PDF changes — nothing to commit."
           else
             git commit -F "$RUNNER_TEMP/commit-msg.txt"
+            git push
+          fi
+
+      # Decoupled, runs after the archive: a parse failure cannot cost us the PDFs,
+      # which are already committed and pushed above. Fails loud on layout drift.
+      - name: Parse PDFs to CSVs
+        run: |
+          uv run scripts/parse > "$RUNNER_TEMP/commit-msg-csv.txt"
+
+      - name: Commit CSVs
+        run: |
+          git add -A data/*.csv
+          if git diff --staged --quiet; then
+            echo "No CSV changes — nothing to commit."
+          else
+            git commit -F "$RUNNER_TEMP/commit-msg-csv.txt"
             git push
           fi

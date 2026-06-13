@@ -1,0 +1,109 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["httpx"]
+# ///
+"""Archive the official RA-APPS imobile lists.
+
+Reads the apps.ro index page, selects the three Transparență PDFs (legal persons,
+natural persons, unoccupied), and downloads them to stable paths under data/.
+
+Pure raw archive: no parsing. Stable filenames mean each edition overwrites the prior
+one, so the git history of each file is the edition history.
+
+Output contract (for the GitHub Action):
+  - stdout: the commit-message body (provenance: source URL + original name + Last-Modified)
+  - stderr: human-readable progress logs
+  - exit 0: the three expected lists were found and downloaded
+  - exit 1: fail loud — fewer/more categories than expected, or a download failed
+"""
+
+import re
+import sys
+from pathlib import Path
+from urllib.parse import urljoin
+
+import httpx
+
+INDEX = "https://www.apps.ro/liste-conform-hg/"
+DATA = Path(__file__).resolve().parent.parent / "data"
+
+# category keyword (searched in the lowercased filename) -> stable archive filename.
+# Order matters: "neocupat" is checked before the persoane buckets.
+CATEGORIES = [
+    ("neocupat", "neocupate.pdf"),
+    ("fizic", "persoane-fizice.pdf"),
+    ("juridic", "persoane-juridice.pdf"),
+]
+HREF_RE = re.compile(r'href="([^"]+\.pdf)"', re.IGNORECASE)
+
+
+def log(msg: str) -> None:
+    print(msg, file=sys.stderr)
+
+
+def categorize(filename: str) -> str | None:
+    """Stable archive name for a Transparență PDF, or None if not one of ours."""
+    low = filename.lower()
+    if "transparent" not in low:
+        return None
+    for keyword, stable in CATEGORIES:
+        if keyword in low:
+            return stable
+    # A Transparență PDF we don't recognize — archive it rather than drop it.
+    return "extra-" + re.sub(r"[^a-z0-9._-]+", "-", low)
+
+
+def main() -> int:
+    client = httpx.Client(follow_redirects=True, timeout=60.0, headers={
+        "User-Agent": "ra-apps-data archiver (+https://github.com/FlorinPopaCodes/ra-apps-data)",
+    })
+
+    log(f"Fetching index {INDEX}")
+    index = client.get(INDEX)
+    index.raise_for_status()
+
+    # Resolve every PDF href against the index URL, dedup, map to a stable name.
+    targets: dict[str, str] = {}  # stable filename -> absolute source URL
+    for href in dict.fromkeys(HREF_RE.findall(index.text)):
+        url = urljoin(INDEX, href)
+        original = url.rsplit("/", 1)[-1]
+        stable = categorize(original)
+        if stable is None:
+            continue
+        if stable in targets:
+            log(f"FAIL: two files map to {stable}: {targets[stable]} and {url}")
+            return 1
+        targets[stable] = url
+
+    found = {name for name in targets if not name.startswith("extra-")}
+    expected = {stable for _, stable in CATEGORIES}
+    missing = expected - found
+    if missing:
+        log(f"FAIL: expected lists not found on index page: {sorted(missing)}")
+        log(f"      saw: {sorted(targets)}")
+        return 1
+
+    DATA.mkdir(exist_ok=True)
+    provenance: list[str] = []
+    for stable, url in sorted(targets.items()):
+        log(f"Downloading {stable} <- {url}")
+        resp = client.get(url)
+        resp.raise_for_status()
+        if resp.headers.get("content-type", "").split(";")[0] != "application/pdf":
+            log(f"FAIL: {url} is not a PDF (content-type {resp.headers.get('content-type')!r})")
+            return 1
+        (DATA / stable).write_bytes(resp.content)
+        original = url.rsplit("/", 1)[-1]
+        last_mod = resp.headers.get("last-modified", "unknown")
+        provenance.append(f"- {stable}: {original} ({last_mod}) <- {url}")
+
+    # Commit-message body on stdout for the workflow to consume.
+    print("Update RA-APPS imobile lists\n")
+    print("\n".join(provenance))
+    log(f"Done: archived {len(targets)} file(s).")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

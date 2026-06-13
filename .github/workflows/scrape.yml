@@ -1,0 +1,41 @@
+name: scrape
+
+on:
+  schedule:
+    # Weekly, Mondays 06:00 UTC. Editions drop on 10 Jun / 10 Dec; weekly is ample
+    # to catch a new edition (and mid-cycle corrections) well within the 6-month window.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: scrape
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Fetch latest edition
+        id: fetch
+        run: |
+          # Fails loud (non-zero) if the three expected lists aren't found.
+          uv run scripts/scrape > "$RUNNER_TEMP/commit-msg.txt"
+
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A data/
+          if git diff --staged --quiet; then
+            echo "No changes — nothing to commit."
+          else
+            git commit -F "$RUNNER_TEMP/commit-msg.txt"
+            git push
+          fi

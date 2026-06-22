@@ -11,11 +11,21 @@ natural persons, unoccupied), and downloads them to stable paths under data/.
 Pure raw archive: no parsing. Stable filenames mean each edition overwrites the prior
 one, so the git history of each file is the edition history.
 
+One narrow, documented exception to fail-loud: the natural-persons list
+(persoane-fizice) is court-suspended (Curtea de Apel București, 15.06.2026, dosar
+3635/2/2026 — publication blocked pending an annulment action against HG 420/2026).
+While the index still carries that suspension notice, we tolerate the fizice PDF being
+absent and archive the rest. The moment the notice is gone but the PDF hasn't returned
+— or any *other* list goes missing — we fail loud, because that's a change we want to
+hear about rather than silently absorb.
+
 Output contract (for the GitHub Action):
   - stdout: the commit-message body (provenance: source URL + original name + Last-Modified)
   - stderr: human-readable progress logs
-  - exit 0: the three expected lists were found and downloaded
-  - exit 1: fail loud — fewer/more categories than expected, or a download failed
+  - exit 0: every expected list archived (persoane-fizice may be skipped only while its
+    suspension notice stands on the index)
+  - exit 1: fail loud — an expected list is missing (other than suspended fizice), the
+    fizice notice is gone but the PDF hasn't returned, a name collision, or a failed download
 """
 
 import re
@@ -36,6 +46,16 @@ CATEGORIES = [
     ("juridic", "persoane-juridice.pdf"),
 ]
 HREF_RE = re.compile(r'href="([^"]+\.pdf)"', re.IGNORECASE)
+
+# The one absence we tolerate: persoane-fizice, while the court-suspension notice for
+# its publication still stands on the index page. Matching the notice (suspension of
+# publication + "persoane fizice") — not just the absent PDF — keeps this tied to the
+# legal reason: if the notice goes and the PDF hasn't returned, we fall through to fail-loud.
+FIZICE_SUSPENDED = "persoane-fizice.pdf"
+FIZICE_SUSPENSION_RE = re.compile(
+    r"suspend\w*.{0,500}?publicar\w*.{0,300}?persoane\s+fizice",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def log(msg: str) -> None:
@@ -79,6 +99,17 @@ def main() -> int:
     found = {name for name in targets if not name.startswith("extra-")}
     expected = {stable for _, stable in CATEGORIES}
     missing = expected - found
+
+    # Tolerate exactly one absence, persoane-fizice, and only while its court-suspension
+    # notice is on the page. Everything else missing — or fizice missing with the notice
+    # gone — stays fail-loud.
+    fizice_suspended = False
+    if FIZICE_SUSPENDED in missing and FIZICE_SUSPENSION_RE.search(index.text):
+        log(f"NOTE: {FIZICE_SUSPENDED} is court-suspended (notice present on index); "
+            "archiving the other lists.")
+        missing = missing - {FIZICE_SUSPENDED}
+        fizice_suspended = True
+
     if missing:
         log(f"FAIL: expected lists not found on index page: {sorted(missing)}")
         log(f"      saw: {sorted(targets)}")
@@ -101,6 +132,8 @@ def main() -> int:
     # Commit-message body on stdout for the workflow to consume.
     print("Update RA-APPS imobile lists\n")
     print("\n".join(provenance))
+    if fizice_suspended:
+        print(f"\n{FIZICE_SUSPENDED}: skipped — court-suspended (notice present on index).")
     log(f"Done: archived {len(targets)} file(s).")
     return 0
 
